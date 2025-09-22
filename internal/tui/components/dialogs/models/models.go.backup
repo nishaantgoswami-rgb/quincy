@@ -33,19 +33,6 @@ const (
 	smallModelInputPlaceholder = "Choose a model for small, simple tasks"
 )
 
-// OAuthConfirmAction represents the action taken in the OAuth confirmation dialog
-type OAuthConfirmAction int
-
-const (
-	OAuthConfirm OAuthConfirmAction = iota
-	OAuthCancel
-)
-
-// OAuthConfirmMsg is sent when the user makes a decision in the OAuth confirmation dialog
-type OAuthConfirmMsg struct {
-	Action OAuthConfirmAction
-}
-
 // ModelSelectedMsg is sent when a model is selected
 type ModelSelectedMsg struct {
 	Model     config.SelectedModel
@@ -83,7 +70,6 @@ type modelDialogCmp struct {
 	apiKeyValue       string
 	isQwen3Coder      bool
 	needsOAuth        bool
-	needsOAuthConfirm bool
 	oauthDialog       oauth.OAuthDialog
 }
 
@@ -182,18 +168,8 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				modelType = config.SelectedModelTypeSmall
 			}
 
-			// Check if this is the special Qwen3 Coder OAuth entry
-			// For this entry, we want to show a confirmation dialog first
-			if selectedItem.Provider.ID == "qwen3-coder-oauth" {
-				// Show OAuth confirmation dialog
-				m.needsOAuthConfirm = true
-				m.selectedModel = selectedItem
-				m.selectedModelType = modelType
-				return m, util.CmdHandler(dialogs.OpenDialogMsg{
-					Model: NewOAuthConfirmDialog(selectedItem.Provider.Name),
-				})
-			} else if m.isProviderConfigured(string(selectedItem.Provider.ID)) {
-				// Provider is already configured, just select it
+			// Check if provider is configured
+			if m.isProviderConfigured(string(selectedItem.Provider.ID)) {
 				return m, tea.Sequence(
 					util.CmdHandler(dialogs.CloseDialogMsg{}),
 					util.CmdHandler(ModelSelectedMsg{
@@ -206,6 +182,16 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						ModelType: modelType,
 					}),
 				)
+			} else if selectedItem.Provider.ID == "qwen3-coder-oauth" {
+				// Special handling for Qwen3 Coder (OAuth) entry
+				// Open OAuth dialog for Qwen3 Coder directly
+				m.needsOAuth = true
+				m.selectedModel = selectedItem
+				m.selectedModelType = modelType
+				m.oauthDialog = oauth.NewQwen3OAuthComponent()
+				return m, util.CmdHandler(dialogs.OpenDialogMsg{
+					Model: m.oauthDialog,
+				})
 			} else {
 				// Check if this is Qwen3 Coder and needs OAuth
 				if m.modelList.IsQwen3Coder() {
@@ -268,39 +254,40 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				u, cmd := m.modelList.Update(msg)
 				m.modelList = u
-				return m, cmd
-			}
-		}
-	case OAuthConfirmMsg:
-		// Handle OAuth confirmation messages
-		switch msg.Action {
-		case OAuthConfirm:
-			// User confirmed OAuth, proceed with OAuth flow
-			m.needsOAuthConfirm = false
-			if m.selectedModel != nil {
-				var modelType config.SelectedModelType
-				if m.modelList.GetModelType() == LargeModelType {
-					modelType = config.SelectedModelTypeLarge
-				} else {
-					modelType = config.SelectedModelTypeSmall
+				
+				// Check if the selection has changed to the Qwen3 Coder OAuth option
+				// and automatically trigger the OAuth flow
+				selectedItem := m.modelList.SelectedModel()
+				currentSelectedID := ""
+				if selectedItem != nil {
+					currentSelectedID = string(selectedItem.Provider.ID) + ":" + selectedItem.Model.ID
 				}
 				
-				m.needsOAuth = true
-				m.selectedModelType = modelType
-				m.oauthDialog = oauth.NewQwen3OAuthComponent()
-				return m, tea.Sequence(
-					util.CmdHandler(dialogs.CloseDialogMsg{}), // Close the model selection dialog first
-					util.CmdHandler(dialogs.OpenDialogMsg{    // Then open the OAuth dialog
+				// Detect when selection changes to Qwen3 Coder OAuth option
+				if selectedItem != nil && selectedItem.Provider.ID == "qwen3-coder-oauth" && m.previousSelectedID != currentSelectedID {
+					// Automatically trigger OAuth flow when Qwen3 Coder OAuth is selected
+					var modelType config.SelectedModelType
+					if m.modelList.GetModelType() == LargeModelType {
+						modelType = config.SelectedModelTypeLarge
+					} else {
+						modelType = config.SelectedModelTypeSmall
+					}
+					
+					m.needsOAuth = true
+					m.selectedModel = selectedItem
+					m.selectedModelType = modelType
+					m.oauthDialog = oauth.NewQwen3OAuthComponent()
+					m.previousSelectedID = currentSelectedID // Update the previous selection
+					return m, util.CmdHandler(dialogs.OpenDialogMsg{
 						Model: m.oauthDialog,
-					}),
-				)
+					})
+				}
+				
+				// Update the previous selection ID
+				m.previousSelectedID = currentSelectedID
+				
+				return m, cmd
 			}
-			return m, nil
-		case OAuthCancel:
-			// User cancelled OAuth, go back to model selection
-			m.needsOAuthConfirm = false
-			m.selectedModel = nil
-			return m, nil
 		}
 	case tea.PasteMsg:
 		if m.needsAPIKey {
@@ -316,26 +303,6 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		u, cmd := m.apiKeyInput.Update(msg)
 		m.apiKeyInput = u.(*APIKeyInput)
 		return m, cmd
-	case dialogs.CloseDialogMsg:
-		// Check if we were in an OAuth flow
-		if m.needsOAuth && m.selectedModel != nil {
-			// OAuth flow completed, send ModelSelectedMsg
-			m.needsOAuth = false
-			selectedModel := *m.selectedModel
-			return m, tea.Sequence(
-				util.CmdHandler(msg), // Close the OAuth dialog first
-				util.CmdHandler(ModelSelectedMsg{
-					Model: config.SelectedModel{
-						Model:           selectedModel.Model.ID,
-						Provider:        string(selectedModel.Provider.ID),
-						ReasoningEffort: selectedModel.Model.DefaultReasoningEffort,
-						MaxTokens:       selectedModel.Model.DefaultMaxTokens,
-					},
-					ModelType: m.selectedModelType,
-				}),
-			)
-		}
-		return m, util.CmdHandler(msg)
 	}
 	return m, nil
 }
@@ -443,9 +410,10 @@ func (m *modelDialogCmp) modelTypeRadio() string {
 
 func (m *modelDialogCmp) isProviderConfigured(providerID string) bool {
 	cfg := config.Get()
-	
-	// Use the new authentication check function
-	return cfg.IsProviderAuthenticated(providerID)
+	if _, ok := cfg.Providers.Get(providerID); ok {
+		return true
+	}
+	return false
 }
 
 func (m *modelDialogCmp) getProvider(providerID catwalk.InferenceProvider) (*catwalk.Provider, error) {

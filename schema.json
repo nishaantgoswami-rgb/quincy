@@ -388,6 +388,27 @@
             "$OPENAI_API_KEY"
           ]
         },
+        "oauth_token": {
+          "type": "string",
+          "description": "OAuth access token for providers that support OAuth authentication"
+        },
+        "oauth_refresh": {
+          "type": "string",
+          "description": "OAuth refresh token for providers that support OAuth authentication"
+        },
+        "oauth_expiry": {
+          "type": "integer",
+          "description": "OAuth token expiry time (Unix timestamp)"
+        },
+        "auth_type": {
+          "type": "string",
+          "enum": [
+            "api_key",
+            "oauth"
+          ],
+          "description": "Authentication type (api_key or oauth)",
+          "default": "api_key"
+        },
         "disable": {
           "type": "boolean",
           "description": "Whether this provider is disabled",

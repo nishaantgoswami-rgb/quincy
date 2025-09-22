@@ -15,10 +15,12 @@ import (
 	"github.com/charmbracelet/crush/internal/tui/components/chat"
 	"github.com/charmbracelet/crush/internal/tui/components/core"
 	"github.com/charmbracelet/crush/internal/tui/components/core/layout"
+	"github.com/charmbracelet/crush/internal/tui/components/dialogs"
 	"github.com/charmbracelet/crush/internal/tui/components/dialogs/models"
 	"github.com/charmbracelet/crush/internal/tui/components/logo"
 	lspcomponent "github.com/charmbracelet/crush/internal/tui/components/lsp"
 	"github.com/charmbracelet/crush/internal/tui/components/mcp"
+	"github.com/charmbracelet/crush/internal/tui/components/oauth"
 	"github.com/charmbracelet/crush/internal/tui/exp/list"
 	"github.com/charmbracelet/crush/internal/tui/styles"
 	"github.com/charmbracelet/crush/internal/tui/util"
@@ -72,6 +74,9 @@ type splashCmp struct {
 	selectedModel *models.ModelOption
 	isAPIKeyValid bool
 	apiKeyValue   string
+	isQwen3Coder  bool
+	needsOAuth    bool
+	oauthDialog   oauth.OAuthDialog
 }
 
 func New() Splash {
@@ -181,53 +186,90 @@ func (s *splashCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					s.isOnboarding = false
 					return s, tea.Batch(cmd, util.CmdHandler(OnboardingCompleteMsg{}))
 				} else {
-					// Provider not configured, show API key input
-					s.needsAPIKey = true
-					s.selectedModel = selectedItem
-					s.apiKeyInput.SetProviderName(selectedItem.Provider.Name)
-					return s, nil
+					// Check if this is Qwen3 Coder and needs OAuth
+					if s.modelList.IsQwen3Coder() {
+						// Open OAuth dialog for Qwen3 Coder
+						s.needsOAuth = true
+						s.oauthDialog = oauth.NewQwen3OAuthComponent()
+						return s, util.CmdHandler(dialogs.OpenDialogMsg{
+							Model: s.oauthDialog,
+						})
+					} else {
+						// Provider not configured, show API key input
+						s.needsAPIKey = true
+						s.selectedModel = selectedItem
+						s.isQwen3Coder = s.modelList.IsQwen3Coder()
+						s.apiKeyInput.SetProviderName(selectedItem.Provider.Name)
+						s.apiKeyInput.SetIsQwen3Coder(s.isQwen3Coder)
+						return s, nil
+					}
 				}
 			} else if s.needsAPIKey {
-				// Handle API key submission
+				// Handle API key submission or OAuth code
 				s.apiKeyValue = strings.TrimSpace(s.apiKeyInput.Value())
 				if s.apiKeyValue == "" {
 					return s, nil
 				}
 
-				provider, err := s.getProvider(s.selectedModel.Provider.ID)
-				if err != nil || provider == nil {
-					return s, util.ReportError(fmt.Errorf("provider %s not found", s.selectedModel.Provider.ID))
-				}
-				providerConfig := config.ProviderConfig{
-					ID:      string(s.selectedModel.Provider.ID),
-					Name:    s.selectedModel.Provider.Name,
-					APIKey:  s.apiKeyValue,
-					Type:    provider.Type,
-					BaseURL: provider.APIEndpoint,
-				}
-				return s, tea.Sequence(
-					util.CmdHandler(models.APIKeyStateChangeMsg{
-						State: models.APIKeyInputStateVerifying,
-					}),
-					func() tea.Msg {
-						start := time.Now()
-						err := providerConfig.TestConnection(config.Get().Resolver())
-						// intentionally wait for at least 750ms to make sure the user sees the spinner
-						elapsed := time.Since(start)
-						if elapsed < 750*time.Millisecond {
-							time.Sleep(750*time.Millisecond - elapsed)
-						}
-						if err == nil {
+				// If it's Qwen3 Coder, handle OAuth flow
+				if s.isQwen3Coder {
+					// For now, we'll treat the entered value as an OAuth token
+					// In a full implementation, this would initiate the OAuth flow
+					return s, tea.Sequence(
+						util.CmdHandler(models.APIKeyStateChangeMsg{
+							State: models.APIKeyInputStateVerifying,
+						}),
+						func() tea.Msg {
+							start := time.Now()
+							// Simulate OAuth token exchange
+							time.Sleep(750 * time.Millisecond)
+							elapsed := time.Since(start)
+							if elapsed < 750*time.Millisecond {
+								time.Sleep(750*time.Millisecond - elapsed)
+							}
 							s.isAPIKeyValid = true
 							return models.APIKeyStateChangeMsg{
 								State: models.APIKeyInputStateVerified,
 							}
-						}
-						return models.APIKeyStateChangeMsg{
-							State: models.APIKeyInputStateError,
-						}
-					},
-				)
+						},
+					)
+				} else {
+					// Handle API key submission
+					provider, err := s.getProvider(s.selectedModel.Provider.ID)
+					if err != nil || provider == nil {
+						return s, util.ReportError(fmt.Errorf("provider %s not found", s.selectedModel.Provider.ID))
+					}
+					providerConfig := config.ProviderConfig{
+						ID:      string(s.selectedModel.Provider.ID),
+						Name:    s.selectedModel.Provider.Name,
+						APIKey:  s.apiKeyValue,
+						Type:    provider.Type,
+						BaseURL: provider.APIEndpoint,
+					}
+					return s, tea.Sequence(
+						util.CmdHandler(models.APIKeyStateChangeMsg{
+							State: models.APIKeyInputStateVerifying,
+						}),
+						func() tea.Msg {
+							start := time.Now()
+							err := providerConfig.TestConnection(config.Get().Resolver())
+							// intentionally wait for at least 750ms to make sure the user sees the spinner
+							elapsed := time.Since(start)
+							if elapsed < 750*time.Millisecond {
+								time.Sleep(750*time.Millisecond - elapsed)
+							}
+							if err == nil {
+								s.isAPIKeyValid = true
+								return models.APIKeyStateChangeMsg{
+									State: models.APIKeyInputStateVerified,
+								}
+							}
+							return models.APIKeyStateChangeMsg{
+								State: models.APIKeyInputStateError,
+							}
+						},
+					)
+				}
 			} else if s.needsProjectInit {
 				return s, s.initializeProject()
 			}
@@ -306,9 +348,20 @@ func (s *splashCmp) saveAPIKeyAndContinue(apiKey string) tea.Cmd {
 	}
 
 	cfg := config.Get()
-	err := cfg.SetProviderAPIKey(string(s.selectedModel.Provider.ID), apiKey)
-	if err != nil {
-		return util.ReportError(fmt.Errorf("failed to save API key: %w", err))
+	
+	// Handle OAuth vs API key
+	if s.isQwen3Coder {
+		// For Qwen3 Coder, save as OAuth token
+		err := cfg.SetProviderCredentials(string(s.selectedModel.Provider.ID), "", apiKey, "", 0, "oauth")
+		if err != nil {
+			return util.ReportError(fmt.Errorf("failed to save OAuth token: %w", err))
+		}
+	} else {
+		// Save as regular API key
+		err := cfg.SetProviderAPIKey(string(s.selectedModel.Provider.ID), apiKey)
+		if err != nil {
+			return util.ReportError(fmt.Errorf("failed to save API key: %w", err))
+		}
 	}
 
 	// Reset API key state and continue with model selection
@@ -413,10 +466,9 @@ func (s *splashCmp) getProvider(providerID catwalk.InferenceProvider) (*catwalk.
 
 func (s *splashCmp) isProviderConfigured(providerID string) bool {
 	cfg := config.Get()
-	if _, ok := cfg.Providers.Get(providerID); ok {
-		return true
-	}
-	return false
+	
+	// Use the new authentication check function
+	return cfg.IsProviderAuthenticated(providerID)
 }
 
 func (s *splashCmp) View() string {

@@ -12,7 +12,6 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/tui/components/core"
 	"github.com/charmbracelet/crush/internal/tui/components/dialogs"
-	"github.com/charmbracelet/crush/internal/tui/components/oauth"
 	"github.com/charmbracelet/crush/internal/tui/exp/list"
 	"github.com/charmbracelet/crush/internal/tui/styles"
 	"github.com/charmbracelet/crush/internal/tui/util"
@@ -32,19 +31,6 @@ const (
 	largeModelInputPlaceholder = "Choose a model for large, complex tasks"
 	smallModelInputPlaceholder = "Choose a model for small, simple tasks"
 )
-
-// OAuthConfirmAction represents the action taken in the OAuth confirmation dialog
-type OAuthConfirmAction int
-
-const (
-	OAuthConfirm OAuthConfirmAction = iota
-	OAuthCancel
-)
-
-// OAuthConfirmMsg is sent when the user makes a decision in the OAuth confirmation dialog
-type OAuthConfirmMsg struct {
-	Action OAuthConfirmAction
-}
 
 // ModelSelectedMsg is sent when a model is selected
 type ModelSelectedMsg struct {
@@ -81,10 +67,6 @@ type modelDialogCmp struct {
 	selectedModelType config.SelectedModelType
 	isAPIKeyValid     bool
 	apiKeyValue       string
-	isQwen3Coder      bool
-	needsOAuth        bool
-	needsOAuthConfirm bool
-	oauthDialog       oauth.OAuthDialog
 }
 
 func NewModelDialogCmp() ModelDialog {
@@ -182,18 +164,8 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				modelType = config.SelectedModelTypeSmall
 			}
 
-			// Check if this is the special Qwen3 Coder OAuth entry
-			// For this entry, we want to show a confirmation dialog first
-			if selectedItem.Provider.ID == "qwen3-coder-oauth" {
-				// Show OAuth confirmation dialog
-				m.needsOAuthConfirm = true
-				m.selectedModel = selectedItem
-				m.selectedModelType = modelType
-				return m, util.CmdHandler(dialogs.OpenDialogMsg{
-					Model: NewOAuthConfirmDialog(selectedItem.Provider.Name),
-				})
-			} else if m.isProviderConfigured(string(selectedItem.Provider.ID)) {
-				// Provider is already configured, just select it
+			// Check if provider is configured
+			if m.isProviderConfigured(string(selectedItem.Provider.ID)) {
 				return m, tea.Sequence(
 					util.CmdHandler(dialogs.CloseDialogMsg{}),
 					util.CmdHandler(ModelSelectedMsg{
@@ -207,31 +179,12 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}),
 				)
 			} else {
-				// Check if this is Qwen3 Coder and needs OAuth
-				if m.modelList.IsQwen3Coder() {
-					// Open OAuth dialog for Qwen3 Coder
-					m.needsOAuth = true
-					m.selectedModel = selectedItem
-					m.selectedModelType = modelType
-					// Use the specific Qwen3 OAuth component if it's our special OAuth entry
-					if selectedItem.Provider.ID == "qwen3-coder-oauth" {
-						m.oauthDialog = oauth.NewQwen3OAuthComponent()
-					} else {
-						m.oauthDialog = oauth.NewOAuthDialogCmp(selectedItem.Provider.Name)
-					}
-					return m, util.CmdHandler(dialogs.OpenDialogMsg{
-						Model: m.oauthDialog,
-					})
-				} else {
-					// Provider not configured, show API key input
-					m.needsAPIKey = true
-					m.selectedModel = selectedItem
-					m.selectedModelType = modelType
-					m.isQwen3Coder = m.modelList.IsQwen3Coder()
-					m.apiKeyInput.SetProviderName(selectedItem.Provider.Name)
-					m.apiKeyInput.SetIsQwen3Coder(m.isQwen3Coder)
-					return m, nil
-				}
+				// Provider not configured, show API key input
+				m.needsAPIKey = true
+				m.selectedModel = selectedItem
+				m.selectedModelType = modelType
+				m.apiKeyInput.SetProviderName(selectedItem.Provider.Name)
+				return m, nil
 			}
 		case key.Matches(msg, m.keyMap.Tab):
 			if m.needsAPIKey {
@@ -271,37 +224,6 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 		}
-	case OAuthConfirmMsg:
-		// Handle OAuth confirmation messages
-		switch msg.Action {
-		case OAuthConfirm:
-			// User confirmed OAuth, proceed with OAuth flow
-			m.needsOAuthConfirm = false
-			if m.selectedModel != nil {
-				var modelType config.SelectedModelType
-				if m.modelList.GetModelType() == LargeModelType {
-					modelType = config.SelectedModelTypeLarge
-				} else {
-					modelType = config.SelectedModelTypeSmall
-				}
-				
-				m.needsOAuth = true
-				m.selectedModelType = modelType
-				m.oauthDialog = oauth.NewQwen3OAuthComponent()
-				return m, tea.Sequence(
-					util.CmdHandler(dialogs.CloseDialogMsg{}), // Close the model selection dialog first
-					util.CmdHandler(dialogs.OpenDialogMsg{    // Then open the OAuth dialog
-						Model: m.oauthDialog,
-					}),
-				)
-			}
-			return m, nil
-		case OAuthCancel:
-			// User cancelled OAuth, go back to model selection
-			m.needsOAuthConfirm = false
-			m.selectedModel = nil
-			return m, nil
-		}
 	case tea.PasteMsg:
 		if m.needsAPIKey {
 			u, cmd := m.apiKeyInput.Update(msg)
@@ -316,26 +238,6 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		u, cmd := m.apiKeyInput.Update(msg)
 		m.apiKeyInput = u.(*APIKeyInput)
 		return m, cmd
-	case dialogs.CloseDialogMsg:
-		// Check if we were in an OAuth flow
-		if m.needsOAuth && m.selectedModel != nil {
-			// OAuth flow completed, send ModelSelectedMsg
-			m.needsOAuth = false
-			selectedModel := *m.selectedModel
-			return m, tea.Sequence(
-				util.CmdHandler(msg), // Close the OAuth dialog first
-				util.CmdHandler(ModelSelectedMsg{
-					Model: config.SelectedModel{
-						Model:           selectedModel.Model.ID,
-						Provider:        string(selectedModel.Provider.ID),
-						ReasoningEffort: selectedModel.Model.DefaultReasoningEffort,
-						MaxTokens:       selectedModel.Model.DefaultMaxTokens,
-					},
-					ModelType: m.selectedModelType,
-				}),
-			)
-		}
-		return m, util.CmdHandler(msg)
 	}
 	return m, nil
 }
@@ -344,7 +246,7 @@ func (m *modelDialogCmp) View() string {
 	t := styles.CurrentTheme()
 
 	if m.needsAPIKey {
-		// Show API key input or OAuth input
+		// Show API key input
 		m.keyMap.isAPIKeyHelp = true
 		m.keyMap.isAPIKeyValid = m.isAPIKeyValid
 		apiKeyView := m.apiKeyInput.View()
@@ -443,9 +345,10 @@ func (m *modelDialogCmp) modelTypeRadio() string {
 
 func (m *modelDialogCmp) isProviderConfigured(providerID string) bool {
 	cfg := config.Get()
-	
-	// Use the new authentication check function
-	return cfg.IsProviderAuthenticated(providerID)
+	if _, ok := cfg.Providers.Get(providerID); ok {
+		return true
+	}
+	return false
 }
 
 func (m *modelDialogCmp) getProvider(providerID catwalk.InferenceProvider) (*catwalk.Provider, error) {
@@ -468,20 +371,9 @@ func (m *modelDialogCmp) saveAPIKeyAndContinue(apiKey string) tea.Cmd {
 	}
 
 	cfg := config.Get()
-	
-	// Handle OAuth vs API key
-	if m.isQwen3Coder {
-		// For Qwen3 Coder, save as OAuth token
-		err := cfg.SetProviderCredentials(string(m.selectedModel.Provider.ID), "", apiKey, "", 0, "oauth")
-		if err != nil {
-			return util.ReportError(fmt.Errorf("failed to save OAuth token: %w", err))
-		}
-	} else {
-		// Save as regular API key
-		err := cfg.SetProviderAPIKey(string(m.selectedModel.Provider.ID), apiKey)
-		if err != nil {
-			return util.ReportError(fmt.Errorf("failed to save API key: %w", err))
-		}
+	err := cfg.SetProviderAPIKey(string(m.selectedModel.Provider.ID), apiKey)
+	if err != nil {
+		return util.ReportError(fmt.Errorf("failed to save API key: %w", err))
 	}
 
 	// Reset API key state and continue with model selection

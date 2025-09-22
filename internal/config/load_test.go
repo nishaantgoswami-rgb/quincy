@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/csync"
@@ -1221,5 +1222,210 @@ func TestConfig_configureSelectedModels(t *testing.T) {
 		require.Equal(t, "large-model", large.Model)
 		require.Equal(t, "openai", large.Provider)
 		require.Equal(t, int64(100), large.MaxTokens)
+	})
+}
+
+func TestConfig_IsQwen3CoderAuthenticated(t *testing.T) {
+	t.Run("returns false when provider doesn't exist", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMap[string, ProviderConfig](),
+		}
+
+		require.False(t, cfg.IsQwen3CoderAuthenticated())
+	})
+
+	t.Run("returns false when provider is disabled", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:      "qwen3-coder-oauth",
+					Disable: true,
+				},
+			}),
+		}
+
+		require.False(t, cfg.IsQwen3CoderAuthenticated())
+	})
+
+	t.Run("returns false when provider has no auth type", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:       "qwen3-coder-oauth",
+					Disable:  false,
+					AuthType: "",
+				},
+			}),
+		}
+
+		require.False(t, cfg.IsQwen3CoderAuthenticated())
+	})
+
+	t.Run("returns false when provider has api_key auth type", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:       "qwen3-coder-oauth",
+					Disable:  false,
+					AuthType: "api_key",
+				},
+			}),
+		}
+
+		require.False(t, cfg.IsQwen3CoderAuthenticated())
+	})
+
+	t.Run("returns false when provider has oauth auth type but no token", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:         "qwen3-coder-oauth",
+					Disable:    false,
+					AuthType:   "oauth",
+					OAuthToken: "",
+				},
+			}),
+		}
+
+		require.False(t, cfg.IsQwen3CoderAuthenticated())
+	})
+
+	t.Run("returns true when provider has oauth auth type with token and no expiry", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:         "qwen3-coder-oauth",
+					Disable:    false,
+					AuthType:   "oauth",
+					OAuthToken: "test-token",
+				},
+			}),
+		}
+
+		require.True(t, cfg.IsQwen3CoderAuthenticated())
+	})
+
+	t.Run("returns true when provider has oauth auth type with token and future expiry", func(t *testing.T) {
+		futureTime := time.Now().Add(1 * time.Hour).Unix()
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:          "qwen3-coder-oauth",
+					Disable:     false,
+					AuthType:    "oauth",
+					OAuthToken:  "test-token",
+					OAuthExpiry: futureTime,
+				},
+			}),
+		}
+
+		require.True(t, cfg.IsQwen3CoderAuthenticated())
+	})
+
+	t.Run("returns false when provider has oauth auth type with token but expired", func(t *testing.T) {
+		pastTime := time.Now().Add(-1 * time.Hour).Unix()
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:          "qwen3-coder-oauth",
+					Disable:     false,
+					AuthType:    "oauth",
+					OAuthToken:  "test-token",
+					OAuthExpiry: pastTime,
+				},
+			}),
+		}
+
+		require.False(t, cfg.IsQwen3CoderAuthenticated())
+	})
+}
+
+func TestConfig_IsProviderAuthenticated(t *testing.T) {
+	t.Run("returns false when provider doesn't exist", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMap[string, ProviderConfig](),
+		}
+
+		require.False(t, cfg.IsProviderAuthenticated("openai"))
+		require.False(t, cfg.IsProviderAuthenticated("qwen3-coder-oauth"))
+	})
+
+	t.Run("returns false when provider is disabled", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"openai": {
+					ID:      "openai",
+					Disable: true,
+					APIKey:  "test-key",
+				},
+				"qwen3-coder-oauth": {
+					ID:         "qwen3-coder-oauth",
+					Disable:    true,
+					AuthType:   "oauth",
+					OAuthToken: "test-token",
+				},
+			}),
+		}
+
+		require.False(t, cfg.IsProviderAuthenticated("openai"))
+		require.False(t, cfg.IsProviderAuthenticated("qwen3-coder-oauth"))
+	})
+
+	t.Run("returns false when regular provider has no API key", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"openai": {
+					ID:      "openai",
+					Disable: false,
+					APIKey:  "",
+				},
+			}),
+		}
+
+		require.False(t, cfg.IsProviderAuthenticated("openai"))
+	})
+
+	t.Run("returns true when regular provider has API key", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"openai": {
+					ID:      "openai",
+					Disable: false,
+					APIKey:  "test-key",
+				},
+			}),
+		}
+
+		require.True(t, cfg.IsProviderAuthenticated("openai"))
+	})
+
+	t.Run("delegates to IsQwen3CoderAuthenticated for Qwen3 Coder", func(t *testing.T) {
+		// Test with authenticated Qwen3 Coder
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:         "qwen3-coder-oauth",
+					Disable:    false,
+					AuthType:   "oauth",
+					OAuthToken: "test-token",
+				},
+			}),
+		}
+
+		require.True(t, cfg.IsProviderAuthenticated("qwen3-coder-oauth"))
+
+		// Test with unauthenticated Qwen3 Coder
+		cfg2 := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"qwen3-coder-oauth": {
+					ID:         "qwen3-coder-oauth",
+					Disable:    false,
+					AuthType:   "oauth",
+					OAuthToken: "",
+				},
+			}),
+		}
+
+		require.False(t, cfg2.IsProviderAuthenticated("qwen3-coder-oauth"))
 	})
 }

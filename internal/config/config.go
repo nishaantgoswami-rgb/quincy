@@ -77,6 +77,14 @@ type ProviderConfig struct {
 	Type catwalk.Type `json:"type,omitempty" jsonschema:"description=Provider type that determines the API format,enum=openai,enum=anthropic,enum=gemini,enum=azure,enum=vertexai,default=openai"`
 	// The provider's API key.
 	APIKey string `json:"api_key,omitempty" jsonschema:"description=API key for authentication with the provider,example=$OPENAI_API_KEY"`
+	// OAuth access token for providers that support OAuth authentication
+	OAuthToken string `json:"oauth_token,omitempty" jsonschema:"description=OAuth access token for providers that support OAuth authentication"`
+	// OAuth refresh token for providers that support OAuth authentication
+	OAuthRefresh string `json:"oauth_refresh,omitempty" jsonschema:"description=OAuth refresh token for providers that support OAuth authentication"`
+	// OAuth token expiry time (Unix timestamp)
+	OAuthExpiry int64 `json:"oauth_expiry,omitempty" jsonschema:"description=OAuth token expiry time (Unix timestamp)"`
+	// Authentication type (api_key or oauth)
+	AuthType string `json:"auth_type,omitempty" jsonschema:"description=Authentication type (api_key or oauth),enum=api_key,enum=oauth"`
 	// Marks the provider as disabled.
 	Disable bool `json:"disable,omitempty" jsonschema:"description=Whether this provider is disabled,default=false"`
 
@@ -292,6 +300,61 @@ func (c *Config) IsConfigured() bool {
 	return len(c.EnabledProviders()) > 0
 }
 
+// IsQwen3CoderAuthenticated checks if the Qwen3 Coder provider is authenticated
+// by verifying if it has a valid OAuth token that hasn't expired yet.
+func (c *Config) IsQwen3CoderAuthenticated() bool {
+	// Get the Qwen3 Coder provider configuration
+	providerConfig, exists := c.Providers.Get("qwen3-coder-oauth")
+	if !exists {
+		return false
+	}
+
+	// Check if the provider is disabled
+	if providerConfig.Disable {
+		return false
+	}
+
+	// For OAuth authentication, check if we have a token and if it's valid
+	if providerConfig.AuthType == "oauth" && providerConfig.OAuthToken != "" {
+		// If we have an expiry time, check if the token is still valid
+		if providerConfig.OAuthExpiry > 0 {
+			// Check if the token has expired
+			if providerConfig.OAuthExpiry <= time.Now().Unix() {
+				return false // Token has expired
+			}
+		}
+		// Token exists and either has no expiry or hasn't expired yet
+		return true
+	}
+
+	// If we get here, the provider is configured but not properly authenticated
+	return false
+}
+
+// IsProviderAuthenticated checks if a provider is authenticated.
+// For Qwen3 Coder, it uses the specialized OAuth check.
+// For other providers, it checks if they have an API key.
+func (c *Config) IsProviderAuthenticated(providerID string) bool {
+	// Special handling for Qwen3 Coder which uses OAuth
+	if providerID == "qwen3-coder-oauth" {
+		return c.IsQwen3CoderAuthenticated()
+	}
+
+	// For other providers, check if they have an API key
+	providerConfig, exists := c.Providers.Get(providerID)
+	if !exists {
+		return false
+	}
+
+	// Check if the provider is disabled
+	if providerConfig.Disable {
+		return false
+	}
+
+	// Check if the provider has an API key
+	return providerConfig.APIKey != ""
+}
+
 func (c *Config) GetModel(provider, model string) *catwalk.Model {
 	if providerConfig, ok := c.Providers.Get(provider); ok {
 		for _, m := range providerConfig.Models {
@@ -383,15 +446,50 @@ func (c *Config) SetConfigField(key string, value any) error {
 }
 
 func (c *Config) SetProviderAPIKey(providerID, apiKey string) error {
-	// First save to the config file
-	err := c.SetConfigField("providers."+providerID+".api_key", apiKey)
-	if err != nil {
-		return fmt.Errorf("failed to save API key to config file: %w", err)
+	return c.SetProviderCredentials(providerID, apiKey, "", "", 0, "api_key")
+}
+
+func (c *Config) SetProviderCredentials(providerID, apiKey, oauthToken, oauthRefresh string, oauthExpiry int64, authType string) error {
+	// Save to the config file
+	var err error
+	if authType == "oauth" {
+		err = c.SetConfigField("providers."+providerID+".oauth_token", oauthToken)
+		if err != nil {
+			return fmt.Errorf("failed to save OAuth token to config file: %w", err)
+		}
+		if oauthRefresh != "" {
+			err = c.SetConfigField("providers."+providerID+".oauth_refresh", oauthRefresh)
+			if err != nil {
+				return fmt.Errorf("failed to save OAuth refresh token to config file: %w", err)
+			}
+		}
+		if oauthExpiry > 0 {
+			err = c.SetConfigField("providers."+providerID+".oauth_expiry", oauthExpiry)
+			if err != nil {
+				return fmt.Errorf("failed to save OAuth expiry to config file: %w", err)
+			}
+		}
+		err = c.SetConfigField("providers."+providerID+".auth_type", authType)
+		if err != nil {
+			return fmt.Errorf("failed to save auth type to config file: %w", err)
+		}
+	} else {
+		err = c.SetConfigField("providers."+providerID+".api_key", apiKey)
+		if err != nil {
+			return fmt.Errorf("failed to save API key to config file: %w", err)
+		}
 	}
 
 	providerConfig, exists := c.Providers.Get(providerID)
 	if exists {
-		providerConfig.APIKey = apiKey
+		if authType == "oauth" {
+			providerConfig.OAuthToken = oauthToken
+			providerConfig.OAuthRefresh = oauthRefresh
+			providerConfig.OAuthExpiry = oauthExpiry
+			providerConfig.AuthType = authType
+		} else {
+			providerConfig.APIKey = apiKey
+		}
 		c.Providers.Set(providerID, providerConfig)
 		return nil
 	}
@@ -412,6 +510,10 @@ func (c *Config) SetProviderAPIKey(providerID, apiKey string) error {
 			BaseURL:      foundProvider.APIEndpoint,
 			Type:         foundProvider.Type,
 			APIKey:       apiKey,
+			OAuthToken:   oauthToken,
+			OAuthRefresh: oauthRefresh,
+			OAuthExpiry:  oauthExpiry,
+			AuthType:     authType,
 			Disable:      false,
 			ExtraHeaders: make(map[string]string),
 			ExtraParams:  make(map[string]string),
@@ -501,7 +603,15 @@ func (c *Config) Resolver() VariableResolver {
 func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 	testURL := ""
 	headers := make(map[string]string)
-	apiKey, _ := resolver.ResolveValue(c.APIKey)
+	
+	// Handle OAuth vs API key authentication
+	var token string
+	if c.AuthType == "oauth" && c.OAuthToken != "" {
+		token = c.OAuthToken
+	} else {
+		token, _ = resolver.ResolveValue(c.APIKey)
+	}
+	
 	switch c.Type {
 	case catwalk.TypeOpenAI:
 		baseURL, _ := resolver.ResolveValue(c.BaseURL)
@@ -513,21 +623,33 @@ func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 		} else {
 			testURL = baseURL + "/models"
 		}
-		headers["Authorization"] = "Bearer " + apiKey
+		if c.AuthType == "oauth" && c.OAuthToken != "" {
+			headers["Authorization"] = "Bearer " + c.OAuthToken
+		} else {
+			headers["Authorization"] = "Bearer " + token
+		}
 	case catwalk.TypeAnthropic:
 		baseURL, _ := resolver.ResolveValue(c.BaseURL)
 		if baseURL == "" {
 			baseURL = "https://api.anthropic.com/v1"
 		}
 		testURL = baseURL + "/models"
-		headers["x-api-key"] = apiKey
+		if c.AuthType == "oauth" && c.OAuthToken != "" {
+			headers["Authorization"] = "Bearer " + c.OAuthToken
+		} else {
+			headers["x-api-key"] = token
+		}
 		headers["anthropic-version"] = "2023-06-01"
 	case catwalk.TypeGemini:
 		baseURL, _ := resolver.ResolveValue(c.BaseURL)
 		if baseURL == "" {
 			baseURL = "https://generativelanguage.googleapis.com"
 		}
-		testURL = baseURL + "/v1beta/models?key=" + url.QueryEscape(apiKey)
+		if c.AuthType == "oauth" && c.OAuthToken != "" {
+			testURL = baseURL + "/v1beta/models?key=" + url.QueryEscape(c.OAuthToken)
+		} else {
+			testURL = baseURL + "/v1beta/models?key=" + url.QueryEscape(token)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

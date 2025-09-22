@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea/v2"
 	"github.com/charmbracelet/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/tui/exp/list"
 	"github.com/charmbracelet/crush/internal/tui/styles"
 	"github.com/charmbracelet/crush/internal/tui/util"
@@ -69,9 +70,22 @@ func (m *ModelListComponent) Init() tea.Cmd {
 }
 
 func (m *ModelListComponent) Update(msg tea.Msg) (*ModelListComponent, tea.Cmd) {
-	u, cmd := m.list.Update(msg)
-	m.list = u.(listModel)
-	return m, cmd
+	switch msg := msg.(type) {
+	case message.ModelsUpdateMsg:
+		// Update the provider models when we receive a ModelsUpdateMsg
+		cfg := config.Get()
+		if providerConfig, exists := cfg.Providers.Get(msg.ProviderID); exists {
+			providerConfig.Models = msg.Models
+			cfg.Providers.Set(msg.ProviderID, providerConfig)
+			// Refresh the model list to show the updated models
+			return m, m.SetModelType(m.modelType)
+		}
+		return m, nil
+	default:
+		u, cmd := m.list.Update(msg)
+		m.list = u.(listModel)
+		return m, cmd
+	}
 }
 
 func (m *ModelListComponent) View() string {
@@ -114,6 +128,33 @@ func (m *ModelListComponent) SetModelType(modelType int) tea.Cmd {
 
 	configuredIcon := t.S().Base.Foreground(t.Success).Render(styles.CheckIcon)
 	configured := fmt.Sprintf("%s %s", configuredIcon, t.S().Subtle.Render("Configured"))
+
+	// Add Qwen3 Coder (OAuth) option at the top
+	qwen3Section := list.NewItemSection("Qwen3 Coder (OAuth)")
+	qwen3Section.SetInfo(t.S().Base.Foreground(t.Primary).Render("OAuth Required"))
+	qwen3Group := list.Group[list.CompletionItem[ModelOption]]{
+		Section: qwen3Section,
+	}
+	
+	// Create a dummy provider for Qwen3 Coder OAuth
+	qwen3Provider := catwalk.Provider{
+		Name: "Qwen3 Coder (OAuth)",
+		ID:   "qwen3-coder-oauth",
+		Models: []catwalk.Model{
+			{
+				ID:   "qwen3-coder",
+				Name: "Qwen3 Coder",
+			},
+		},
+	}
+	
+	qwen3Item := list.NewCompletionItem("Qwen3 Coder", ModelOption{
+		Provider: qwen3Provider,
+		Model:    qwen3Provider.Models[0],
+	}, list.WithCompletionID("qwen3-coder-oauth:qwen3-coder"))
+	
+	qwen3Group.Items = append(qwen3Group.Items, qwen3Item)
+	groups = append(groups, qwen3Group)
 
 	// Create a map to track which providers we've already added
 	addedProviders := make(map[string]bool)
@@ -251,4 +292,16 @@ func (m *ModelListComponent) GetModelType() int {
 
 func (m *ModelListComponent) SetInputPlaceholder(placeholder string) {
 	m.list.SetInputPlaceholder(placeholder)
+}
+
+// IsQwen3Coder checks if the selected model is Qwen3 Coder
+func (m *ModelListComponent) IsQwen3Coder() bool {
+	selected := m.SelectedModel()
+	if selected == nil {
+		return false
+	}
+	
+	// Check if the provider ID contains "qwen" (case insensitive)
+	providerID := strings.ToLower(string(selected.Provider.ID))
+	return strings.Contains(providerID, "qwen") || providerID == "qwen3-coder-oauth"
 }

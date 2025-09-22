@@ -19,6 +19,7 @@ const (
 	APIKeyInputStateVerifying
 	APIKeyInputStateVerified
 	APIKeyInputStateError
+	APIKeyInputStateOAuth
 )
 
 type APIKeyStateChangeMsg struct {
@@ -33,6 +34,7 @@ type APIKeyInput struct {
 	state        APIKeyInputState
 	title        string
 	showTitle    bool
+	isQwen3Coder bool
 }
 
 func NewAPIKeyInput() *APIKeyInput {
@@ -54,6 +56,7 @@ func NewAPIKeyInput() *APIKeyInput {
 		),
 		providerName: "Provider",
 		showTitle:    true,
+		isQwen3Coder: false,
 	}
 }
 
@@ -64,6 +67,11 @@ func (a *APIKeyInput) SetProviderName(name string) {
 
 func (a *APIKeyInput) SetShowTitle(show bool) {
 	a.showTitle = show
+}
+
+func (a *APIKeyInput) SetIsQwen3Coder(isQwen3Coder bool) {
+	a.isQwen3Coder = isQwen3Coder
+	a.updateStatePresentation()
 }
 
 func (a *APIKeyInput) GetTitle() string {
@@ -110,20 +118,36 @@ func (a *APIKeyInput) updateStatePresentation() {
 
 	switch a.state {
 	case APIKeyInputStateInitial:
-		titlePrefix := prefixStyle.Render("Enter your ")
-		a.title = titlePrefix + accentStyle.Render(a.providerName+" API Key") + prefixStyle.Render(".")
+		if a.isQwen3Coder {
+			titlePrefix := prefixStyle.Render("Authenticate with ")
+			a.title = titlePrefix + accentStyle.Render(a.providerName) + prefixStyle.Render(".")
+			a.input.Placeholder = "Paste your authorization code here..."
+		} else {
+			titlePrefix := prefixStyle.Render("Enter your ")
+			a.title = titlePrefix + accentStyle.Render(a.providerName+" API Key") + prefixStyle.Render(".")
+			a.input.Placeholder = "Enter your API key..."
+		}
 		a.input.SetStyles(t.S().TextInput)
 		a.input.Prompt = "> "
 	case APIKeyInputStateVerifying:
-		titlePrefix := prefixStyle.Render("Verifying your ")
-		a.title = titlePrefix + accentStyle.Render(a.providerName+" API Key") + prefixStyle.Render("...")
+		if a.isQwen3Coder {
+			titlePrefix := prefixStyle.Render("Exchanging authorization code with ")
+			a.title = titlePrefix + accentStyle.Render(a.providerName) + prefixStyle.Render("...")
+		} else {
+			titlePrefix := prefixStyle.Render("Verifying your ")
+			a.title = titlePrefix + accentStyle.Render(a.providerName+" API Key") + prefixStyle.Render("...")
+		}
 		ts := t.S().TextInput
 		// make the blurred state be the same
 		ts.Blurred.Prompt = ts.Focused.Prompt
 		a.input.Prompt = a.spinner.View()
 		a.input.Blur()
 	case APIKeyInputStateVerified:
-		a.title = accentStyle.Render(a.providerName+" API Key") + prefixStyle.Render(" validated.")
+		if a.isQwen3Coder {
+			a.title = accentStyle.Render(a.providerName) + prefixStyle.Render(" authenticated.")
+		} else {
+			a.title = accentStyle.Render(a.providerName+" API Key") + prefixStyle.Render(" validated.")
+		}
 		ts := t.S().TextInput
 		// make the blurred state be the same
 		ts.Blurred.Prompt = ts.Focused.Prompt
@@ -131,12 +155,22 @@ func (a *APIKeyInput) updateStatePresentation() {
 		a.input.Prompt = styles.CheckIcon + " "
 		a.input.Blur()
 	case APIKeyInputStateError:
-		a.title = errorStyle.Render("Invalid ") + accentStyle.Render(a.providerName+" API Key") + errorStyle.Render(". Try again?")
+		if a.isQwen3Coder {
+			a.title = errorStyle.Render("Authentication failed with ") + accentStyle.Render(a.providerName) + errorStyle.Render(". Try again?")
+		} else {
+			a.title = errorStyle.Render("Invalid ") + accentStyle.Render(a.providerName+" API Key") + errorStyle.Render(". Try again?")
+		}
 		ts := t.S().TextInput
 		ts.Focused.Prompt = ts.Focused.Prompt.Foreground(t.Cherry)
 		a.input.Focus()
 		a.input.SetStyles(ts)
 		a.input.Prompt = styles.ErrorIcon + " "
+	case APIKeyInputStateOAuth:
+		titlePrefix := prefixStyle.Render("Authenticate with ")
+		a.title = titlePrefix + accentStyle.Render(a.providerName) + prefixStyle.Render(".")
+		a.input.Placeholder = "Paste your authorization code here..."
+		a.input.SetStyles(t.S().TextInput)
+		a.input.Prompt = "> "
 	}
 }
 

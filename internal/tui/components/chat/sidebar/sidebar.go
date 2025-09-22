@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/home"
 	"github.com/charmbracelet/crush/internal/lsp"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/tui/components/chat"
@@ -94,6 +95,15 @@ func (m *sidebarCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.files = csync.NewMap[string, SessionFile]()
 		for _, file := range msg.Files {
 			m.files.Set(file.FilePath, file)
+		}
+		return m, nil
+
+	case message.ModelsUpdateMsg:
+		// Update the provider models when we receive a ModelsUpdateMsg
+		cfg := config.Get()
+		if providerConfig, exists := cfg.Providers.Get(msg.ProviderID); exists {
+			providerConfig.Models = msg.Models
+			cfg.Providers.Set(msg.ProviderID, providerConfig)
 		}
 		return m, nil
 
