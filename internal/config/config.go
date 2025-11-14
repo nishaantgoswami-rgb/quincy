@@ -28,9 +28,17 @@ const (
 const (
 	QwenOAuthBaseURL        = "https://chat.qwen.ai"
 	QwenTokenEndpoint       = QwenOAuthBaseURL + "/api/v1/oauth2/token"
-	QwenClientID            = "f0304373b74a44d2b584a3fb70ca9e56"
+	QwenDefaultClientID     = "f0304373b74a44d2b584a3fb70ca9e56" // OAuth 2.0 public client ID (safe to embed per RFC 8628)
 	QwenRefreshGrantType    = "refresh_token"
 )
+
+// getQwenClientID returns the Qwen OAuth client ID, checking environment variable first.
+func getQwenClientID() string {
+	if clientID := os.Getenv("QWEN_CLIENT_ID"); clientID != "" {
+		return clientID
+	}
+	return QwenDefaultClientID
+}
 
 var defaultContextPaths = []string{
 	".github/copilot-instructions.md",
@@ -318,7 +326,7 @@ func (c *Config) refreshQwen3Token(providerID string, refreshToken string) error
 	data := url.Values{}
 	data.Set("grant_type", QwenRefreshGrantType)
 	data.Set("refresh_token", refreshToken)
-	data.Set("client_id", QwenClientID)
+	data.Set("client_id", getQwenClientID())
 
 	slog.Debug("Prepared token refresh request", "grant_type", QwenRefreshGrantType)
 

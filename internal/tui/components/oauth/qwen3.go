@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -33,12 +34,180 @@ const (
 	QwenDeviceCodeEndpoint  = QwenOAuthBaseURL + "/api/v1/oauth2/device/code"
 	QwenTokenEndpoint       = QwenOAuthBaseURL + "/api/v1/oauth2/token"
 	QwenModelsEndpoint      = QwenOAuthBaseURL + "/api/v1/models"
-	QwenClientID            = "f0304373b74a44d2b584a3fb70ca9e56"
+	QwenDefaultClientID     = "f0304373b74a44d2b584a3fb70ca9e56" // OAuth 2.0 public client ID (safe to embed per RFC 8628)
 	QwenScope               = "openid profile email model.completion"
 	QwenGrantType           = "urn:ietf:params:oauth:grant-type:device_code"
 	QwenRefreshGrantType    = "refresh_token"
 	QwenCodeChallengeMethod = "S256"
 )
+
+// getQwenClientID returns the Qwen OAuth client ID, checking environment variable first.
+// For OAuth 2.0 Device Flow (RFC 8628), client IDs are public and safe to embed.
+// Environment variable allows override for testing or alternative configurations.
+func getQwenClientID() string {
+	if clientID := os.Getenv("QWEN_CLIENT_ID"); clientID != "" {
+		slog.Debug("Using Qwen client ID from environment variable")
+		return clientID
+	}
+	return QwenDefaultClientID
+}
+
+// qwenModelSpecs maps known Qwen model IDs to their actual specifications.
+// Based on official Qwen documentation and research (2025).
+var qwenModelSpecs = map[string]catwalk.Model{
+	// Qwen3-Coder models (coding-specialized, NO vision support)
+	"qwen3-coder-480b": {
+		ContextWindow:      262144, // 256K native, up to 1M with extrapolation
+		DefaultMaxTokens:   8192,
+		CanReason:          true,
+		HasReasoningEffort: false,
+		SupportsImages:     false, // Qwen3-Coder does NOT support images
+	},
+	"qwen3-coder": {
+		ContextWindow:      262144,
+		DefaultMaxTokens:   8192,
+		CanReason:          true,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	// Qwen3 general models
+	"qwen3-32b": {
+		ContextWindow:          131072, // 128K
+		DefaultMaxTokens:       8192,
+		CanReason:              true,
+		HasReasoningEffort:     true, // Only Qwen3-32B supports reasoning_effort
+		DefaultReasoningEffort: "medium",
+		SupportsImages:         false,
+	},
+	"qwen3-235b": {
+		ContextWindow:      131072,
+		DefaultMaxTokens:   8192,
+		CanReason:          true,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	// Qwen Max/Plus/Turbo API models
+	"qwen-max": {
+		ContextWindow:      262144, // 256K tokens
+		DefaultMaxTokens:   8192,
+		CanReason:          true,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	"qwen-plus": {
+		ContextWindow:      1000000, // 1M tokens
+		DefaultMaxTokens:   8192,
+		CanReason:          true,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	"qwen-turbo": {
+		ContextWindow:      131072, // 128K tokens
+		DefaultMaxTokens:   4096,
+		CanReason:          false,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	"qwen-flash": {
+		ContextWindow:      131072, // 128K tokens
+		DefaultMaxTokens:   4096,
+		CanReason:          false,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	// Qwen 2.5 models with long context
+	"qwen2.5-72b": {
+		ContextWindow:      131072, // 128K base
+		DefaultMaxTokens:   8192,
+		CanReason:          true,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	"qwen2.5-7b": {
+		ContextWindow:      131072,
+		DefaultMaxTokens:   4096,
+		CanReason:          false,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	"qwen2.5-14b": {
+		ContextWindow:      131072,
+		DefaultMaxTokens:   4096,
+		CanReason:          true,
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+	// QwQ reasoning models
+	"qwq-32b": {
+		ContextWindow:      32768,
+		DefaultMaxTokens:   4096,
+		CanReason:          true, // Dedicated reasoning model
+		HasReasoningEffort: false,
+		SupportsImages:     false,
+	},
+}
+
+// getModelSpecs returns the model specifications for a given model ID.
+// If the exact model ID is not found, it attempts pattern matching.
+// Falls back to conservative defaults if no match is found.
+func getModelSpecs(modelID string) catwalk.Model {
+	// Direct match
+	if spec, exists := qwenModelSpecs[modelID]; exists {
+		slog.Debug("Found exact model specs", "model", modelID, "context_window", spec.ContextWindow)
+		return spec
+	}
+
+	// Pattern matching for model variants (e.g., "qwen3-coder-30b" matches "qwen3-coder")
+	lowerID := strings.ToLower(modelID)
+	for knownID, spec := range qwenModelSpecs {
+		if strings.Contains(lowerID, knownID) {
+			slog.Debug("Found model specs via pattern match", "model", modelID, "matched", knownID, "context_window", spec.ContextWindow)
+			return spec
+		}
+	}
+
+	// Conservative defaults for unknown models
+	slog.Warn("Unknown Qwen model, using conservative defaults", "model", modelID)
+	return catwalk.Model{
+		ContextWindow:      32768, // Conservative 32K default
+		DefaultMaxTokens:   4096,
+		CanReason:          false, // Conservative: assume no reasoning
+		HasReasoningEffort: false,
+		SupportsImages:     false, // Conservative: assume no vision
+	}
+}
+
+// getFallbackModels returns a default set of Qwen models when API fetch fails.
+// These are common models available via Qwen OAuth.
+func getFallbackModels() []catwalk.Model {
+	return []catwalk.Model{
+		{
+			ID:                 "qwen3-coder",
+			Name:               "Qwen3 Coder",
+			ContextWindow:      262144,
+			DefaultMaxTokens:   8192,
+			CanReason:          true,
+			HasReasoningEffort: false,
+			SupportsImages:     false,
+		},
+		{
+			ID:               "qwen-plus",
+			Name:             "Qwen Plus",
+			ContextWindow:    1000000,
+			DefaultMaxTokens: 8192,
+			CanReason:        true,
+			SupportsImages:   false,
+		},
+		{
+			ID:               "qwen-turbo",
+			Name:             "Qwen Turbo",
+			ContextWindow:    131072,
+			DefaultMaxTokens: 4096,
+			CanReason:        false,
+			SupportsImages:   false,
+		},
+	}
+}
 
 // Device Authorization Response
 type DeviceAuthResponse struct {
@@ -465,11 +634,35 @@ func (q *Qwen3OAuthComponent) startPollingForTokens() tea.Msg {
 	// Fetch available models from Qwen API
 	slog.Info("Fetching models from Qwen API")
 	models, fetchErr := q.fetchModels(tokenResp.AccessToken)
+
+	var catwalkModels []catwalk.Model
+
 	if fetchErr != nil {
 		slog.Error("Failed to fetch models from Qwen API", "error", fetchErr)
-		// We'll continue with the authentication even if model fetching fails
-		// The user can still use the default model
-		// Set success state and close the OAuth dialog after a short delay
+		slog.Warn("Using fallback models due to API fetch failure")
+		// Use fallback models when API fetch fails
+		catwalkModels = getFallbackModels()
+	} else {
+		slog.Info("Successfully fetched models from Qwen API", "model_count", len(models.Data))
+		// Convert the fetched models to catwalk models with proper specifications
+		catwalkModels = make([]catwalk.Model, len(models.Data))
+		for i, model := range models.Data {
+			// Get the proper model specifications based on the model ID
+			specs := getModelSpecs(model.ID)
+
+			// Copy specs and set ID and Name from the API response
+			catwalkModels[i] = specs
+			catwalkModels[i].ID = model.ID
+			catwalkModels[i].Name = model.ID
+		}
+	}
+
+	// Update the provider config with the models (either fetched or fallback)
+	cfg := config.Get()
+	providerConfig, exists := cfg.Providers.Get("qwen3-coder-oauth")
+	if !exists {
+		slog.Error("Provider config not found for qwen3-coder-oauth")
+		// Continue anyway with success state - authentication worked
 		return tea.Sequence(
 			func() tea.Msg {
 				return Qwen3OAuthStateChangeMsg{
@@ -481,62 +674,29 @@ func (q *Qwen3OAuthComponent) startPollingForTokens() tea.Msg {
 				return dialogs.CloseDialogMsg{}
 			}),
 		)
-	} else {
-		slog.Info("Successfully fetched models from Qwen API", "model_count", len(models.Data))
-		// Convert the fetched models to catwalk models
-		catwalkModels := make([]catwalk.Model, len(models.Data))
-		for i, model := range models.Data {
-			catwalkModels[i] = catwalk.Model{
-				ID:                     model.ID,
-				Name:                   model.ID, // Using ID as name for now
-				ContextWindow:          128000, // Default context window, should be updated based on actual model specs
-				DefaultMaxTokens:       4096,   // Default max tokens, should be updated based on actual model specs
-				CanReason:              true,   // Assuming Qwen models can reason
-				HasReasoningEffort:     true,   // Assuming Qwen models have reasoning effort
-				DefaultReasoningEffort: "medium", // Default reasoning effort
-				SupportsImages:         true,   // Assuming Qwen models support images
-			}
-		}
-
-		// Update the provider config with the fetched models
-		cfg := config.Get()
-		if providerConfig, exists := cfg.Providers.Get("qwen3-coder-oauth"); exists {
-			providerConfig.Models = catwalkModels
-			cfg.Providers.Set("qwen3-coder-oauth", providerConfig)
-
-			// Send a message to update the model list in the UI
-			return tea.Sequence(
-				func() tea.Msg {
-					return message.ModelsUpdateMsg{
-						ProviderID: "qwen3-coder-oauth",
-						Models:     catwalkModels,
-					}
-				},
-				func() tea.Msg {
-					return Qwen3OAuthStateChangeMsg{
-						State: Qwen3OAuthStateSuccess,
-					}
-				},
-				tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
-					slog.Info("Closing OAuth dialog")
-					return dialogs.CloseDialogMsg{}
-				}),
-			)
-		} else {
-			// Set success state and close the OAuth dialog after a short delay
-			return tea.Sequence(
-				func() tea.Msg {
-					return Qwen3OAuthStateChangeMsg{
-						State: Qwen3OAuthStateSuccess,
-					}
-				},
-				tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
-					slog.Info("Closing OAuth dialog")
-					return dialogs.CloseDialogMsg{}
-				}),
-			)
-		}
 	}
+
+	providerConfig.Models = catwalkModels
+	cfg.Providers.Set("qwen3-coder-oauth", providerConfig)
+
+	// Send a message to update the model list in the UI
+	return tea.Sequence(
+		func() tea.Msg {
+			return message.ModelsUpdateMsg{
+				ProviderID: "qwen3-coder-oauth",
+				Models:     catwalkModels,
+			}
+		},
+		func() tea.Msg {
+			return Qwen3OAuthStateChangeMsg{
+				State: Qwen3OAuthStateSuccess,
+			}
+		},
+		tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
+			slog.Info("Closing OAuth dialog")
+			return dialogs.CloseDialogMsg{}
+		}),
+	)
 }
 
 // fetchModels retrieves the list of available models from the Qwen API
@@ -610,16 +770,17 @@ func (q *Qwen3OAuthComponent) exchangeDeviceCodeForTokens(deviceCode string) (*T
 	slog.Debug("Attempting to exchange device code for tokens")
 
 	// Log request details for debugging
+	clientID := getQwenClientID()
 	slog.Debug("Token exchange request details",
 		"grant_type", QwenGrantType,
-		"client_id", QwenClientID,
+		"client_id", clientID,
 		"device_code_length", len(deviceCode),
 		"code_verifier_length", len(q.codeVerifier))
 
 	// Prepare the request body
 	data := url.Values{}
 	data.Set("grant_type", QwenGrantType)
-	data.Set("client_id", QwenClientID)
+	data.Set("client_id", clientID)
 	data.Set("device_code", deviceCode)
 	data.Set("code_verifier", q.codeVerifier)
 	// Create the HTTP request
@@ -811,20 +972,22 @@ func (q *Qwen3OAuthComponent) StartOAuthFlow() tea.Cmd {
 			q.pollInterval = 5 * time.Second // Default to 5 seconds if not provided
 		}
 
-		// Calculate max attempts based on expiration time (with some buffer)
+		// Calculate max attempts based on expiration time (with 20% buffer)
+		// Typical device codes expire in 1800 seconds (30 minutes)
 		q.maxAttempts = int(float64(deviceAuthResp.ExpiresIn) / q.pollInterval.Seconds() * 1.2)
 		if q.maxAttempts < 10 {
-			q.maxAttempts = 10 // Minimum attempts
+			q.maxAttempts = 10 // Minimum attempts (for very short expirations)
 		}
-		if q.maxAttempts > 100 {
-			q.maxAttempts = 100 // Maximum attempts
+		if q.maxAttempts > 360 {
+			q.maxAttempts = 360 // Maximum attempts (30 min at 5s intervals)
 		}
 		q.attemptCount = 0
 
 		slog.Debug("OAuth polling configuration",
 			"interval", q.pollInterval,
 			"max_attempts", q.maxAttempts,
-			"expires_in", deviceAuthResp.ExpiresIn)
+			"expires_in", deviceAuthResp.ExpiresIn,
+			"estimated_timeout_seconds", int(float64(q.maxAttempts)*q.pollInterval.Seconds()))
 
 		// Try to open the verification URL in the browser
 		var openErr error
@@ -871,14 +1034,15 @@ func (q *Qwen3OAuthComponent) requestDeviceAuthorization(codeVerifier string, co
 	}
 
 	// Prepare the request body
+	clientID := getQwenClientID()
 	data := url.Values{}
-	data.Set("client_id", QwenClientID)
+	data.Set("client_id", clientID)
 	data.Set("scope", QwenScope)
 	data.Set("code_challenge", codeChallenge)
 	data.Set("code_challenge_method", QwenCodeChallengeMethod)
 
 	slog.Debug("Device authorization request prepared",
-		"client_id", QwenClientID,
+		"client_id", clientID,
 		"scope", QwenScope,
 		"code_challenge_method", QwenCodeChallengeMethod)
 
