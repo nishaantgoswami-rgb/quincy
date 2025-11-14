@@ -2,7 +2,9 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -21,6 +23,22 @@ const (
 	appName              = "crush"
 	defaultDataDirectory = ".crush"
 )
+
+// Qwen OAuth Configuration
+const (
+	QwenOAuthBaseURL        = "https://chat.qwen.ai"
+	QwenTokenEndpoint       = QwenOAuthBaseURL + "/api/v1/oauth2/token"
+	QwenDefaultClientID     = "f0304373b74a44d2b584a3fb70ca9e56" // OAuth 2.0 public client ID (safe to embed per RFC 8628)
+	QwenRefreshGrantType    = "refresh_token"
+)
+
+// getQwenClientID returns the Qwen OAuth client ID, checking environment variable first.
+func getQwenClientID() string {
+	if clientID := os.Getenv("QWEN_CLIENT_ID"); clientID != "" {
+		return clientID
+	}
+	return QwenDefaultClientID
+}
 
 var defaultContextPaths = []string{
 	".github/copilot-instructions.md",
@@ -300,8 +318,123 @@ func (c *Config) IsConfigured() bool {
 	return len(c.EnabledProviders()) > 0
 }
 
+// refreshQwen3Token attempts to refresh an expired Qwen OAuth token using the refresh token.
+func (c *Config) refreshQwen3Token(providerID string, refreshToken string) error {
+	slog.Info("Attempting to refresh Qwen OAuth token", "provider", providerID)
+
+	// Prepare the token refresh request
+	data := url.Values{}
+	data.Set("grant_type", QwenRefreshGrantType)
+	data.Set("refresh_token", refreshToken)
+	data.Set("client_id", getQwenClientID())
+
+	slog.Debug("Prepared token refresh request", "grant_type", QwenRefreshGrantType)
+
+	// Create the HTTP request
+	req, err := http.NewRequest("POST", QwenTokenEndpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		slog.Error("Failed to create token refresh request", "error", err)
+		return fmt.Errorf("failed to create token refresh request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	slog.Debug("Sending token refresh request to Qwen", "endpoint", QwenTokenEndpoint)
+
+	// Make the request
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Error("Token refresh request failed", "error", err)
+		return fmt.Errorf("token refresh request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	slog.Debug("Received token refresh response", "status_code", resp.StatusCode)
+
+	// Handle error responses
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			slog.Error("Failed to read error response body", "error", readErr)
+		} else {
+			slog.Debug("Token refresh error response body", "body", string(bodyBytes))
+			var errorResp struct {
+				Error            string `json:"error"`
+				ErrorDescription string `json:"error_description"`
+			}
+			if decodeErr := json.Unmarshal(bodyBytes, &errorResp); decodeErr == nil && errorResp.Error != "" {
+				if errorResp.ErrorDescription != "" {
+					slog.Error("Token refresh error", "error", errorResp.Error, "description", errorResp.ErrorDescription)
+					return fmt.Errorf("token refresh failed: %s - %s", errorResp.Error, errorResp.ErrorDescription)
+				}
+				slog.Error("Token refresh error", "error", errorResp.Error)
+				return fmt.Errorf("token refresh failed: %s", errorResp.Error)
+			}
+		}
+		slog.Error("Token refresh failed", "status_code", resp.StatusCode)
+		return fmt.Errorf("token refresh request failed with status %d", resp.StatusCode)
+	}
+
+	// Parse the successful response
+	type TokenResponse struct {
+		AccessToken  string `json:"access_token"`
+		TokenType    string `json:"token_type"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+		Scope        string `json:"scope"`
+		Error        string `json:"error,omitempty"`
+	}
+
+	var tokenResp TokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		slog.Error("Failed to parse token refresh response", "error", err)
+		return fmt.Errorf("failed to parse token refresh response: %w", err)
+	}
+
+	slog.Debug("Token refresh response parsed",
+		"access_token_present", tokenResp.AccessToken != "",
+		"refresh_token_present", tokenResp.RefreshToken != "",
+		"token_type", tokenResp.TokenType,
+		"expires_in", tokenResp.ExpiresIn)
+
+	// Verify we got the required tokens
+	if tokenResp.AccessToken == "" {
+		slog.Error("Token refresh succeeded but no access token was returned")
+		return fmt.Errorf("token refresh succeeded but no access token was returned")
+	}
+
+	// If no new refresh token was provided, use the old one
+	newRefreshToken := tokenResp.RefreshToken
+	if newRefreshToken == "" {
+		slog.Debug("No new refresh token provided, using existing refresh token")
+		newRefreshToken = refreshToken
+	}
+
+	// Calculate new expiry time
+	currentTime := time.Now().Unix()
+	newExpiry := currentTime + int64(tokenResp.ExpiresIn)
+
+	// Save the new tokens
+	err = c.SetProviderCredentials(providerID, "", tokenResp.AccessToken, newRefreshToken, newExpiry, "oauth")
+	if err != nil {
+		slog.Error("Failed to save refreshed OAuth tokens", "error", err)
+		return fmt.Errorf("failed to save refreshed OAuth tokens: %w", err)
+	}
+
+	slog.Info("Token refresh successful",
+		"access_token_length", len(tokenResp.AccessToken),
+		"token_type", tokenResp.TokenType,
+		"refresh_token_present", tokenResp.RefreshToken != "",
+		"expires_in", tokenResp.ExpiresIn)
+
+	return nil
+}
+
 // IsQwen3CoderAuthenticated checks if the Qwen3 Coder provider is authenticated
 // by verifying if it has a valid OAuth token that hasn't expired yet.
+// If the token has expired but a refresh token is available, it attempts to refresh the token.
 func (c *Config) IsQwen3CoderAuthenticated() bool {
 	// Get the Qwen3 Coder provider configuration
 	providerConfig, exists := c.Providers.Get("qwen3-coder-oauth")
@@ -320,7 +453,20 @@ func (c *Config) IsQwen3CoderAuthenticated() bool {
 		if providerConfig.OAuthExpiry > 0 {
 			// Check if the token has expired
 			if providerConfig.OAuthExpiry <= time.Now().Unix() {
-				return false // Token has expired
+				// Token has expired, try to refresh it if we have a refresh token
+				if providerConfig.OAuthRefresh != "" {
+					slog.Info("OAuth token expired, attempting refresh", "provider", "qwen3-coder-oauth")
+					err := c.refreshQwen3Token("qwen3-coder-oauth", providerConfig.OAuthRefresh)
+					if err != nil {
+						slog.Error("Failed to refresh OAuth token", "error", err)
+						return false // Refresh failed
+					}
+					// Refresh succeeded, the token is now valid
+					return true
+				}
+				// No refresh token available
+				slog.Warn("OAuth token expired and no refresh token available")
+				return false
 			}
 		}
 		// Token exists and either has no expiry or hasn't expired yet
